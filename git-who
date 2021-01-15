@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+#
+# Usage
+# cd to the directory holding source, it can tbe a top level dir
+# with many git checkouts underneath
+#
+#   cd /foo/bar/src
+#   git-whos init
+#   git-who [--csv] stats some/path
+#
+# License: GPLv2
+# Copyright: Tech DNA LLC
+# Authors:
+#  - Martin Langhoff martin.langhoff@tech-dna.net
+
+import subprocess
+import os, re, sys
+from collections import OrderedDict 
+import argparse
+import sqlite3
+import datetime
+
+startdir = os.getcwd()
+
+class GitWho:
+
+    def add_commit_count_to_stats(self, file_path, author, months_bucket):
+        upsert_sql = '''
+            INSERT INTO file_author_data(file_path, author, commits_%s)
+            VALUES (?, ?, 1)
+            ON CONFLICT(file_path, author) DO UPDATE SET commits_%s = commits_%s + 1;
+        ''' % (months_bucket, months_bucket, months_bucket)
+        cur = self.db.cursor()
+        return cur.execute(upsert_sql, [file_path, author])
+
+    def add_blame_count_to_stats(self, file_path, author, count):
+        insert_sql = '''
+            INSERT INTO file_author_data(file_path, author, lines)
+            VALUES (?,?,?)
+        '''
+        cur = self.db.cursor()
+        return cur.execute(insert_sql, [file_path, author, count])
+
+    def ignore_dir(self, dirpath):
+        for pat in self.ignore_patterns:
+            if pat in dirpath:
+                return True
+        return False
+
+    def db_exec(self, sql):
+        cur = self.db.cursor()
+        return cur.execute(sql)
+
+    def init_sqlite(self):
+        self.get_sqlite(True)
+        sql = '''    
+                CREATE TABLE IF NOT EXISTS file_author_data (
+                    file_path  TEXT,
+                    author     TEXT,
+                    exclude    int DEFAULT 0, 
+                    commits_3  int DEFAULT 0,
+                    commits_6  int DEFAULT 0,
+                    commits_12 int DEFAULT 0,
+                    lines      int default 0,
+                    CONSTRAINT PK_FA PRIMARY KEY (file_path, author));
+        '''
+        self.db_exec(sql)
+        sql = '''
+                CREATE TABLE IF NOT EXISTS author_aliases (
+                    author TEXT,
+                    author_alias TEXT
+                );
+        '''
+        self.db_exec(sql)
+
+    def get_sqlite(self, first_time=False):
+        db_file_path='.git-who.sqlite3'
+        if os.path.exists(db_file_path) or first_time:
+            self.db = sqlite3.connect(db_file_path)
+            return self.db
+        die("git-whosmissing database does not exist; you might need to run init")
+
+    def stats(self):
+        self.get_sqlite()
+
+        sql_all = '''
+            SELECT COALESCE(aa.author_alias, fad.author), SUM(lines) AS sum_lines, SUM(commits_3), SUM(commits_6), SUM(commits_12)
+            FROM file_author_data fad
+            LEFT OUTER JOIN author_aliases aa ON (fad.author=aa.author)
+            WHERE exclude = 0
+            GROUP BY COALESCE(aa.author_alias, fad.author)
+            ORDER BY sum_lines DESC
+        '''
+        sql_path = '''
+            SELECT COALESCE(aa.author_alias, fad.author), SUM(lines) AS sum_lines, SUM(commits_3), SUM(commits_6), SUM(commits_12)
+            FROM file_author_data fad
+            LEFT OUTER JOIN author_aliases aa ON (fad.author=aa.author)
+            WHERE exclude   = 0 AND file_path LIKE ?
+            GROUP BY COALESCE(aa.author_alias, fad.author)
+            ORDER BY sum_lines DESC
+        '''
+        sql_path = '''
+            SELECT fad.author, SUM(lines) AS sum_lines, SUM(commits_3), SUM(commits_6), SUM(commits_12)
+            FROM file_author_data fad
+            WHERE exclude   = 0 AND file_path LIKE ?
+            GROUP BY fad.author
+            ORDER BY sum_lines DESC
+        '''
+        cur = self.db.cursor()
+        if self.args.rest and self.args.rest[0]:
+            path=self.args.rest[0]
+            if not path.startswith('/'):
+                path = '/' + path
+            if not path.endswith('/'):
+                path = path + '/'
+            path = path + '%'
+            cur.execute(sql_path, [path])
+        else:
+            cur.execute(sql_all)
+        stats = cur.fetchall()
+        if self.csv:
+            print("Author, blame_lines, commits last 3m, last 6m, last 12m")
+            for stat in stats:
+                # stats come as ints, cast them to string before join...
+                print(','.join(map(str, list(stat))))
+        else:
+            fmt = '{:<40} {:>20} {:>7} {:>7} {:>7}'
+            print(fmt.format('author', 'blame_lines', '3m commits', '6m', '12m'))
+            for stat in stats:
+                print(fmt.format(stat[0], stat[1],  stat[2],  stat[3],  stat[4]))
+
+    def show_excluded(self):
+        self.get_sqlite()
+        sql='''
+                SELECT distinct(file_path)
+                FROM file_author_data
+                WHERE exclude = 1
+                ORDER BY file_path ASC
+            '''
+        cur = self.db.cursor()
+        cur.execute(sql)
+        results = cur.fetchall()
+        for rec in results:
+            print(rec[0])
+
+    def add_exclude(self):
+        self.get_sqlite()
+        sql='''
+                UPDATE file_author_data
+                SET exclude = 1
+                WHERE file_path LIKE ?
+            '''
+        cur = self.db.cursor()
+        if self.args.rest and self.args.rest[0]:
+            path=self.args.rest[0]
+            isdir = os.path.isdir(path)
+            if not path.endswith('/') and isdir:
+                path = path + '/'
+            if path.startswith('.'):
+                path[0] = 'path[1:]'
+            if not path.startswith('/'):
+                path = '/' + path
+            if isdir:
+                path = path + '%'
+            cur.execute(sql, [path])
+            #print(path)
+            print("Excluded %s paths" % cur.rowcount)
+            cur.execute('COMMIT')
+
+    def show_aliases(self):
+        self.get_sqlite()
+        sql='''
+                SELECT author, author_alias
+                FROM author_aliases
+                ORDER BY author ASC
+            '''
+        cur = self.db.cursor()
+        cur.execute(sql)
+        results = cur.fetchall()
+        for rec in results:
+            print(rec[0] + ' -> ' + rec[1])
+
+    def add_alias(self):
+        self.get_sqlite()
+        sql='''
+                INSERT INTO author_aliases(author, author_alias)
+                VALUES (?,?)
+            '''
+        cur = self.db.cursor()
+        cur.execute(sql, [self.args.rest[0], self.args.rest[1]])
+        cur.execute('COMMIT')
+
+    def process_repo_log(self, git_checkout_path):
+        os.chdir(git_checkout_path)
+        self.db_exec('BEGIN TRANSACTION')
+
+        if git_checkout_path.startswith('.'):
+            git_checkout_path = git_checkout_path[1:]
+        if git_checkout_path.startswith('/'):
+            git_checkout_path = git_checkout_path[1:]
+        if not git_checkout_path.endswith('/'):
+            git_checkout_path = git_checkout_path + '/'
+
+        log = subprocess.check_output(['git', 'log', '--date=iso-strict', '--name-status', '--since=12.months.ago'], text=True)
+        '''
+        commit 37f5b877bf6c88c5a5766fdf92f9a0acb154f224
+        Author: Mike Kelly <mike.kelly@tech-dna.net>
+        Date:   2020-05-21T16:43:59-07:00
+
+            * Updated Berkeley surveryor config scripts
+            * Some Policheck scripts
+
+        D       Policheck/ReadMe.txt
+        A       Policheck/SQL/PCResultDBCreate.bat
+        A       Policheck/SQL/PCResultDBScript.sql
+        A       Policheck/SQL/carry-exclude-file-from-surveyor.sql
+        A       Policheck/readme.md
+        M       bin/wget.exe
+        M       surveyor/config/Microsoft/Berkeley/MSSQL/GeneralQuery.sql
+        '''
+        now = datetime.datetime.now(datetime.timezone.utc)
+        date_3m_ago = now - datetime.timedelta(days=90)
+        date_6m_ago = now - datetime.timedelta(days=180)
+        for log_entry in re.split(r'\ncommit ', log):
+            if not len(log_entry):
+                continue
+            m = re.search(r'\nAuthor: (.+?)\n', log_entry)
+            author = m.group(1)
+            m = re.search(r'<(.+?)>', author)
+            author = m.group(1)
+
+            m = re.search(r'\nDate: (.+?)\n', log_entry)
+            date = m.group(1).strip()
+            date = datetime.datetime.fromisoformat(date)
+
+            months_bucket = 12
+            if date > date_3m_ago:
+                months_bucket = 3
+            elif date > date_6m_ago:
+                months_bucket = 6
+
+            for linematch in re.finditer(r'\n(A|M|D)\t\w.*\n', log_entry):
+                line = linematch.group(0)
+                line = line[2:]
+                line = line.strip()
+                # print('%s %s %s' % (git_checkout_path + line, author, months_bucket))
+                self.add_commit_count_to_stats(git_checkout_path + line, author, months_bucket)
+        self.db_exec('COMMIT')
+        os.chdir(startdir)
+
+    def process_repo_blame(self, git_checkout_path):
+        os.chdir(git_checkout_path)
+        if git_checkout_path.startswith('.'):
+            git_checkout_path = git_checkout_path[1:]
+        if git_checkout_path.startswith('/'):
+            git_checkout_path = git_checkout_path[1:]
+        if not git_checkout_path.endswith('/'):
+            git_checkout_path = git_checkout_path + '/'
+
+        file_list = subprocess.check_output([ 'git', 'ls-tree', '-r', '--name-only', 'HEAD'], text=True)
+        self.db_exec('BEGIN TRANSACTION')
+        for file_path in file_list.splitlines():
+            filetype = subprocess.check_output([ 'file', '-b', '--mime-type', file_path], text=True)
+            if filetype.startswith('text'):
+                p1 = subprocess.Popen([ 'git', 'blame', '--line-porcelain', 'HEAD', file_path ],
+                                    stdout=subprocess.PIPE)
+                p2 = subprocess.Popen([ 'grep', '-a', '^author-mail '],
+                                    stdin=p1.stdout, stdout=subprocess.PIPE)
+                p3 = subprocess.Popen([ 'sed', '-e', 's/<//;s/>//;s/author-mail //'],
+                                    stdin=p2.stdout, stdout=subprocess.PIPE)
+                p4 = subprocess.Popen([ 'sort' ],
+                                        stdin=p3.stdout, stdout=subprocess.PIPE)
+                p5 = subprocess.Popen([ 'uniq', '-c' ],
+                                        stdin=p4.stdout, stdout=subprocess.PIPE)
+                p6 = subprocess.Popen([ 'sort', '-nr' ],
+                                        stdin=p5.stdout, stdout=subprocess.PIPE, text=True)
+                stdout, stderr = p6.communicate()
+                for line in stdout.splitlines():
+                    line = line.strip()
+                    m = re.match('^\s*(\d+) (.+)$', line)
+                    if m:
+                        count = int(m.groups()[0])
+                        email = m.groups()[1].strip()
+                    if self.verbose:
+                        print('Blame: adding  for: %s %s %s' % (git_checkout_path + file_path, email, count))
+                    self.add_blame_count_to_stats(git_checkout_path + file_path, email, count)
+            else:
+                if self.verbose:
+                    print("Blame: skipping non-text file %s" % git_checkout_path, file_path)
+        self.db_exec('COMMIT')
+        os.chdir(startdir)
+
+    def init(self):
+        self.init_sqlite()
+
+        gitrepos= subprocess.check_output(['find', '.', '-name', '.git', '-type', 'd', '-not', '-path', '*/.*/*'], text=True)
+
+        for gitrepo in gitrepos.splitlines():
+            os.chdir(startdir)
+            gitrepo = os.path.dirname(gitrepo)
+            if self.ignore_dir(gitrepo):
+                if self.verbose:
+                    print("Skipping %s" % gitrepo)
+                continue
+            if self.verbose:
+                print('gitrepo is %s' % gitrepo)
+
+            self.process_repo_blame(gitrepo)
+            self.process_repo_log(gitrepo)
+
+    def __init__(self):
+        parser = argparse.ArgumentParser(
+            description='Ask Git who has been working here',
+            usage='''git-who <command> [<args>]
+
+The most commonly used git commands are:
+   init                             Parse git data
+   stats  [path]                    Print stats for a given path
+   show_excluded                    Lists excluded paths
+   add_exclude foo/bar              Adds path to exclusions
+   show_aliases                     Lists aliases
+   add_alias user@gmail user@work   Add an alias
+''')
+        ignore_patterns = []
+        verbose = False
+        csv = False
+        parser.add_argument("-i", "--ignore",
+                  action="append", dest="ignore_patterns",
+                  help="Ignore directories matching pattern")
+        parser.add_argument("-v", "--verbose",
+                  action="store_true", dest="verbose", default=False,
+                  help="Be verbose")
+        parser.add_argument("--csv",
+                  action="store_true", dest="csv", default=False,
+                  help="Output CSV format")
+        parser.add_argument('command', help='Subcommand to run')
+        parser.add_argument('rest', nargs=argparse.REMAINDER)
+
+        args = parser.parse_args()
+        if not hasattr(self, args.command):
+            print('Unrecognized command')
+            parser.print_help()
+            exit(1)
+        self.ignore_patterns = ignore_patterns
+        self.verbose = args.verbose
+        self.csv = args.csv
+        self.args = args
+        # dispatcher
+        getattr(self, args.command)()
+
+if __name__ == '__main__':
+    GitWho()
